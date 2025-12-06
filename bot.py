@@ -12,6 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
 # ---------- Google Sheets helper ----------
 
 def get_gsheet_client():
@@ -29,7 +30,9 @@ def get_gsheet_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    credentials = service_account.Credentials.from_service_account_info(
+        info, scopes=scopes
+    )
     gc = gspread.authorize(credentials)
     return gc
 
@@ -49,9 +52,12 @@ def get_worksheet():
     return ws
 
 
-def log_to_sheet(username: str, user_id: int, text: str):
+def log_to_sheet(username: str, client: str, project: str, description: str):
     """
     Append a single row to the sheet.
+
+    Sheet columns:
+      Timestamp | Username | Client | Project | Description
     """
     ws = get_worksheet()
 
@@ -59,7 +65,10 @@ def log_to_sheet(username: str, user_id: int, text: str):
     ist = timezone(timedelta(hours=5, minutes=30))
     ts = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-    ws.append_row([ts, username or "", str(user_id), text], value_input_option="USER_ENTERED")
+    ws.append_row(
+        [ts, username or "", client, project, description],
+        value_input_option="USER_ENTERED",
+    )
 
 
 # ---------- Telegram handlers ----------
@@ -67,10 +76,11 @@ def log_to_sheet(username: str, user_id: int, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 Hi! I’m your progress tracking bot.\n\n"
-        "Use the /log command to save your progress to Google Sheets.\n"
+        "Use the /log command to save completed tasks to Google Sheets.\n\n"
+        "Format:\n"
+        "  /log client | project | description\n\n"
         "Example:\n"
-        "  /log did 20 pushups\n\n"
-        "I’ll store timestamp, your username, and the text you send."
+        "  /log Client A | Website Revamp | Homepage UI done"
     )
     await update.message.reply_text(msg)
 
@@ -80,25 +90,50 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ Available commands:\n"
         "/start – Welcome message.\n"
         "/help – This help message.\n"
-        "/log <text> – Save a progress entry.\n\n"
-        "Example: /log read 10 pages of a book"
+        "/log client | project | description – Save a completed task.\n\n"
+        "Example:\n"
+        "/log Client A | Website Revamp | Homepage UI done"
     )
     await update.message.reply_text(msg)
 
 
 async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /log client | project | description
+
+    Example:
+      /log Client A | Website Revamp | Homepage UI done
+    """
     if not context.args:
-        await update.message.reply_text("Please add some text, e.g.\n/log did 20 pushups")
+        await update.message.reply_text(
+            "Please use:\n"
+            "/log client | project | description\n\n"
+            "Example:\n"
+            "/log Client A | Website Revamp | Homepage UI done"
+        )
         return
 
-    text = " ".join(context.args)
+    # Rebuild full text after /log, then split by '|'
+    full_text = " ".join(context.args)
+    parts = [p.strip() for p in full_text.split("|")]
+
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "I need 3 parts separated by '|':\n"
+            "client | project | description\n\n"
+            "Example:\n"
+            "/log Client A | Website Revamp | Homepage UI done"
+        )
+        return
+
+    client, project, description = parts[0], parts[1], "|".join(parts[2:]).strip()
 
     user = update.effective_user
     username = user.username or f"{user.first_name or ''} {user.last_name or ''}".strip()
-    user_id = user.id
 
     try:
-        log_to_sheet(username, user_id, text)
+        log_to_sheet(username, client, project, description)
     except Exception as e:
         print("Error logging to sheet:", e)
         await update.message.reply_text(
@@ -106,7 +141,9 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("✅ Logged to Google Sheets!")
+    await update.message.reply_text(
+        f"✅ Logged task for client '{client}', project '{project}'."
+    )
 
 
 # ---------- Main entry ----------
