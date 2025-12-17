@@ -7,11 +7,8 @@ import gspread
 from google.oauth2 import service_account
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
+
 
 # ================= GOOGLE SHEETS =================
 
@@ -34,6 +31,7 @@ def logs_ws():
 def summary_ws():
     return sheet().worksheet("Summary")
 
+
 # ================= HELPERS =================
 
 def now_ist():
@@ -46,8 +44,9 @@ def headers():
 def find_row(client, project):
     rows = summary_ws().get_all_values()
     for i, r in enumerate(rows[1:], start=2):
-        if len(r) >= 2 and r[0].lower() == client.lower() and r[1].lower() == project.lower():
-            return i
+        if len(r) >= 2:
+            if r[0].strip().lower() == client.lower() and r[1].strip().lower() == project.lower():
+                return i
     return None
 
 def ensure_row(client, project):
@@ -61,7 +60,7 @@ def add_quantity(client, project, task, qty):
     hdr = headers()
 
     if task not in hdr:
-        return False, "Task not found"
+        return False, f"Task '{task}' not found in Summary"
 
     col = hdr.index(task) + 1
     current = ws.cell(row, col).value
@@ -69,55 +68,82 @@ def add_quantity(client, project, task, qty):
     ws.update_cell(row, col, current + qty)
     return True, None
 
-# ================= ASYNC WORK =================
 
-async def process_qty(update: Update, client, project, task, qty):
+# ================= BACKGROUND WORK =================
+
+async def process_qty(update, client, project, task, qty):
     add_quantity(client, project, task, qty)
     logs_ws().append_row(
         [now_ist(), update.effective_user.username or "", client, project, f"{task} +{qty}"],
         value_input_option="USER_ENTERED",
     )
 
-async def process_log(update: Update, client, project, desc):
+async def process_log(update, client, project, desc):
     logs_ws().append_row(
         [now_ist(), update.effective_user.username or "", client, project, desc],
         value_input_option="USER_ENTERED",
     )
 
+
 # ================= COMMANDS =================
 
-async def qty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if text.count("|") < 3:
-        await update.message.reply_text("Use: /qty Client | Project | Task | +number")
-        return
-
-    client, project, task, qty = [x.strip() for x in text.split("|", 3)]
-    qty = float(qty.replace("+", "").strip())
-
-    # ACK immediately
-    await update.message.reply_text("✅ Updating…")
-
-    # Run slow work AFTER ACK
-    asyncio.create_task(process_qty(update, client, project, task, qty))
-
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 *Welcome to Progress Tracking Bot*\n\n"
+        "Commands:\n"
+        "/log Client | Project | description\n"
+        "/qty Client | Project | Task | +number\n"
+        "/status Client | Project\n\n"
+        "Example:\n"
+        "/qty Oepl | moil | Raw Material | +10",
+        parse_mode="Markdown",
+    )
 
 async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     if "|" not in text:
-        await update.message.reply_text("Use: /log Client | Project | description")
+        await update.message.reply_text(
+            "Use:\n/log Client | Project | description"
+        )
         return
 
     client, project, desc = [x.strip() for x in text.split("|", 2)]
 
+    # ACK immediately
     await update.message.reply_text("✅ Logged")
+
     asyncio.create_task(process_log(update, client, project, desc))
 
+async def qty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /qty Client | Project | Task | +number
+    """
+    text = " ".join(context.args)
+    if text.count("|") < 3:
+        await update.message.reply_text(
+            "Use:\n/qty Client | Project | Task | +number"
+        )
+        return
+
+    client, project, task, qty = [x.strip() for x in text.split("|", 3)]
+
+    try:
+        qty = float(qty.replace("+", "").strip())
+    except ValueError:
+        await update.message.reply_text("❌ Quantity must be a number")
+        return
+
+    # ACK fast
+    await update.message.reply_text("✅ Updating quantity…")
+
+    asyncio.create_task(process_qty(update, client, project, task, qty))
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     if "|" not in text:
-        await update.message.reply_text("Use: /status Client | Project")
+        await update.message.reply_text(
+            "Use:\n/status Client | Project"
+        )
         return
 
     client, project = [x.strip() for x in text.split("|", 1)]
@@ -125,7 +151,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = find_row(client, project)
 
     if not row:
-        await update.message.reply_text("Project not found")
+        await update.message.reply_text("❌ Project not found")
         return
 
     hdr = headers()
@@ -134,20 +160,28 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = ws.cell(row, hdr.index("Status (%)") + 1).value
 
     await update.message.reply_text(
-        f"📊 {client} / {project}\nTasks: {tasks}\nCompleted: {completed}\nStatus: {status}"
+        f"📊 *{client} / {project}*\n"
+        f"Tasks: {tasks}\n"
+        f"Completed: {completed}\n"
+        f"Status: {status}",
+        parse_mode="Markdown",
     )
+
 
 # ================= MAIN =================
 
 def main():
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-    app.add_handler(CommandHandler("qty", qty_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("log", log_cmd))
+    app.add_handler(CommandHandler("qty", qty_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
     PORT = int(os.environ.get("PORT", 10000))
     URL = os.environ["RENDER_EXTERNAL_URL"]
+
+    print("🚀 Bot starting in WEBHOOK mode (FREE Render)")
 
     app.run_webhook(
         listen="0.0.0.0",
@@ -155,6 +189,7 @@ def main():
         url_path=os.environ["TELEGRAM_TOKEN"],
         webhook_url=f"{URL}/{os.environ['TELEGRAM_TOKEN']}",
     )
+
 
 if __name__ == "__main__":
     main()
