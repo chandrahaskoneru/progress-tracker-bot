@@ -1,13 +1,17 @@
 import os
 import json
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import gspread
 from google.oauth2 import service_account
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
 # ================= GOOGLE SHEETS =================
 
@@ -17,23 +21,18 @@ def get_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = service_account.Credentials.from_service_account_info(
-        creds, scopes=scopes
+    return gspread.authorize(
+        service_account.Credentials.from_service_account_info(creds, scopes=scopes)
     )
-    return gspread.authorize(credentials)
 
-
-def get_sheet():
+def sheet():
     return get_client().open(os.environ.get("SHEET_NAME", "ProgressLog"))
 
-
 def logs_ws():
-    return get_sheet().worksheet("Logs")
-
+    return sheet().worksheet("Logs")
 
 def summary_ws():
-    return get_sheet().worksheet("Summary")
-
+    return sheet().worksheet("Summary")
 
 # ================= HELPERS =================
 
@@ -41,153 +40,121 @@ def now_ist():
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-
-def summary_headers():
+def headers():
     return summary_ws().row_values(1)
 
-
-def find_summary_row(client, project):
+def find_row(client, project):
     rows = summary_ws().get_all_values()
     for i, r in enumerate(rows[1:], start=2):
-        if len(r) >= 2:
-            if r[0].strip().lower() == client.lower() and r[1].strip().lower() == project.lower():
-                return i
+        if len(r) >= 2 and r[0].lower() == client.lower() and r[1].lower() == project.lower():
+            return i
     return None
 
-
-def create_summary_row(client, project):
-    headers = summary_headers()
-    row = [client, project] + [0] * (len(headers) - 2)
-    summary_ws().append_row(row, value_input_option="USER_ENTERED")
-
-
-def ensure_summary_row(client, project):
-    if not find_summary_row(client, project):
-        create_summary_row(client, project)
-
+def ensure_row(client, project):
+    if not find_row(client, project):
+        summary_ws().append_row([client, project] + [0] * (len(headers()) - 2))
 
 def add_quantity(client, project, task, qty):
     ws = summary_ws()
-    ensure_summary_row(client, project)
-    row = find_summary_row(client, project)
-    headers = summary_headers()
+    ensure_row(client, project)
+    row = find_row(client, project)
+    hdr = headers()
 
-    if task not in headers:
-        return False, f"Task '{task}' not found in Summary"
+    if task not in hdr:
+        return False, "Task not found"
 
-    col = headers.index(task) + 1
+    col = hdr.index(task) + 1
     current = ws.cell(row, col).value
     current = float(current) if current else 0
     ws.update_cell(row, col, current + qty)
     return True, None
 
+# ================= ASYNC WORK =================
 
-# ================= COMMANDS =================
-
-async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if "|" not in text:
-        await update.message.reply_text(
-            "Use:\n/log Client | Project | description"
-        )
-        return
-
-    client, project, desc = [x.strip() for x in text.split("|", 2)]
-    user = update.effective_user
-    username = user.username or user.first_name or ""
-
-    logs_ws().append_row(
-        [now_ist(), username, client, project, desc],
-        value_input_option="USER_ENTERED",
-    )
-
-    await update.message.reply_text("✅ Logged")
-
-
-async def qty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /qty Client | Project | Task | +number
-    """
-    text = " ".join(context.args)
-    if text.count("|") < 3:
-        await update.message.reply_text(
-            "Use:\n/qty Client | Project | Task | +number"
-        )
-        return
-
-    client, project, task, qty = [x.strip() for x in text.split("|", 3)]
-
-    try:
-        qty = float(qty.replace("+", "").strip())
-    except ValueError:
-        await update.message.reply_text("❌ Quantity must be a number")
-        return
-
-    ok, err = add_quantity(client, project, task, qty)
-    if not ok:
-        await update.message.reply_text(f"❌ {err}")
-        return
-
+async def process_qty(update: Update, client, project, task, qty):
+    add_quantity(client, project, task, qty)
     logs_ws().append_row(
         [now_ist(), update.effective_user.username or "", client, project, f"{task} +{qty}"],
         value_input_option="USER_ENTERED",
     )
 
-    await update.message.reply_text(
-        f"✅ Updated\n{client} / {project}\n{task}: +{qty}"
+async def process_log(update: Update, client, project, desc):
+    logs_ws().append_row(
+        [now_ist(), update.effective_user.username or "", client, project, desc],
+        value_input_option="USER_ENTERED",
     )
+
+# ================= COMMANDS =================
+
+async def qty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+    if text.count("|") < 3:
+        await update.message.reply_text("Use: /qty Client | Project | Task | +number")
+        return
+
+    client, project, task, qty = [x.strip() for x in text.split("|", 3)]
+    qty = float(qty.replace("+", "").strip())
+
+    # ACK immediately
+    await update.message.reply_text("✅ Updating…")
+
+    # Run slow work AFTER ACK
+    asyncio.create_task(process_qty(update, client, project, task, qty))
+
+
+async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+    if "|" not in text:
+        await update.message.reply_text("Use: /log Client | Project | description")
+        return
+
+    client, project, desc = [x.strip() for x in text.split("|", 2)]
+
+    await update.message.reply_text("✅ Logged")
+    asyncio.create_task(process_log(update, client, project, desc))
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     if "|" not in text:
-        await update.message.reply_text(
-            "Use:\n/status Client | Project"
-        )
+        await update.message.reply_text("Use: /status Client | Project")
         return
 
     client, project = [x.strip() for x in text.split("|", 1)]
     ws = summary_ws()
-    row = find_summary_row(client, project)
+    row = find_row(client, project)
 
     if not row:
-        await update.message.reply_text("❌ Project not found in Summary")
+        await update.message.reply_text("Project not found")
         return
 
-    headers = ws.row_values(1)
-
-    try:
-        tasks_col = headers.index("Tasks") + 1
-        completed_col = headers.index("Completed") + 1
-        status_col = headers.index("Status (%)") + 1
-    except ValueError:
-        await update.message.reply_text("❌ Summary columns missing")
-        return
-
-    tasks = ws.cell(row, tasks_col).value
-    completed = ws.cell(row, completed_col).value
-    status = ws.cell(row, status_col).value
+    hdr = headers()
+    tasks = ws.cell(row, hdr.index("Tasks") + 1).value
+    completed = ws.cell(row, hdr.index("Completed") + 1).value
+    status = ws.cell(row, hdr.index("Status (%)") + 1).value
 
     await update.message.reply_text(
-        f"📊 {client} / {project}\n"
-        f"Tasks: {tasks}\n"
-        f"Completed: {completed}\n"
-        f"Status: {status}"
+        f"📊 {client} / {project}\nTasks: {tasks}\nCompleted: {completed}\nStatus: {status}"
     )
-
 
 # ================= MAIN =================
 
 def main():
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-    app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler("qty", qty_cmd))
+    app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
-    print("🚀 Bot started in POLLING mode")
-    app.run_polling()
+    PORT = int(os.environ.get("PORT", 10000))
+    URL = os.environ["RENDER_EXTERNAL_URL"]
 
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=os.environ["TELEGRAM_TOKEN"],
+        webhook_url=f"{URL}/{os.environ['TELEGRAM_TOKEN']}",
+    )
 
 if __name__ == "__main__":
     main()
