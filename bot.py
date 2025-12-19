@@ -1,12 +1,15 @@
 import os
 import json
-import asyncio
 from datetime import datetime, timezone, timedelta
 
 import gspread
 from google.oauth2 import service_account
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,13 +50,16 @@ def headers():
     return summary_ws().row_values(1)
 
 def get_clients():
-    ws = summary_ws()
-    values = ws.col_values(1)[1:]
-    return sorted(set(v for v in values if v))
+    rows = summary_ws().get_all_values()[1:]
+    clients = set()
+    for r in rows:
+        if len(r) >= 2 and r[0] and r[1]:
+            clients.add(r[0])
+    return sorted(clients)
 
 def get_projects(client):
     rows = summary_ws().get_all_values()[1:]
-    return sorted(set(r[1] for r in rows if r and r[0] == client))
+    return sorted(set(r[1] for r in rows if len(r) >= 2 and r[0] == client and r[1]))
 
 def get_tasks():
     hdr = headers()
@@ -87,19 +93,18 @@ def add_quantity(client, project, task, qty):
     hdr = headers()
 
     if task not in hdr:
-        return False, "Task not found"
+        return
 
     col = hdr.index(task) + 1
     current = ws.cell(row, col).value
     current = float(current) if current else 0
     ws.update_cell(row, col, current + qty)
-    return True, None
 
 # ================= USER STATE =================
 
 user_state = {}
 
-# ================= COMMANDS =================
+# ================= /START =================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.pop(update.effective_user.id, None)
@@ -197,7 +202,7 @@ async def qty_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qty = float(update.message.text)
     except ValueError:
-        await update.message.reply_text("❌ Please enter a number only")
+        await update.message.reply_text("❌ Enter numbers only")
         return
 
     s = user_state[user_id]
@@ -232,13 +237,14 @@ def main():
     PORT = int(os.environ.get("PORT", 10000))
     URL = os.environ["RENDER_EXTERNAL_URL"]
 
-    print("🚀 Bot running with dynamic buttons (FREE Render)")
+    print("🚀 Bot running (Webhook + Health Check enabled)")
 
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=os.environ["TELEGRAM_TOKEN"],
         webhook_url=f"{URL}/{os.environ['TELEGRAM_TOKEN']}",
+        health_check_path="/",   # ⭐ REQUIRED FOR UPTIMEROBOT ⭐
     )
 
 if __name__ == "__main__":
