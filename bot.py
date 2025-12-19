@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import gspread
@@ -34,14 +35,14 @@ def get_gspread_client():
         service_account.Credentials.from_service_account_info(creds, scopes=scopes)
     )
 
-def get_sheet():
+def sheet():
     return get_gspread_client().open(os.environ.get("SHEET_NAME", "ProgressLog"))
 
 def summary_ws():
-    return get_sheet().worksheet("Summary")
+    return sheet().worksheet("Summary")
 
 def logs_ws():
-    return get_sheet().worksheet("Logs")
+    return sheet().worksheet("Logs")
 
 # ======================================================
 # HELPERS
@@ -56,11 +57,11 @@ def headers():
 
 def get_clients():
     rows = summary_ws().get_all_values()[1:]
-    clients = set()
-    for r in rows:
-        if len(r) >= 2 and r[0].strip() and r[1].strip():
-            clients.add(r[0].strip())
-    return sorted(clients)
+    return sorted({
+        r[0].strip()
+        for r in rows
+        if len(r) >= 2 and r[0].strip() and r[1].strip()
+    })
 
 def get_projects(client):
     rows = summary_ws().get_all_values()[1:]
@@ -71,18 +72,17 @@ def get_projects(client):
     })
 
 def get_tasks():
-    hdr = headers()
     ignore = {"Client", "Project", "Tasks", "Completed", "Status (%)"}
     return [
-        h for h in hdr
+        h for h in headers()
         if h not in ignore and not h.endswith("Plan")
     ]
 
 def find_row(client, project):
     rows = summary_ws().get_all_values()
-    for idx, r in enumerate(rows[1:], start=2):
+    for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 2 and r[0] == client and r[1] == project:
-            return idx
+            return i
     return None
 
 def ensure_row(client, project):
@@ -107,117 +107,63 @@ def add_quantity(client, project, task, qty):
 user_state = {}
 
 # ======================================================
-# COMMANDS
+# BOT HANDLERS
 # ======================================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.pop(update.effective_user.id, None)
-
-    buttons = [
-        [InlineKeyboardButton(c, callback_data=f"client|{c}")]
-        for c in get_clients()
-    ]
-
+    buttons = [[InlineKeyboardButton(c, callback_data=f"client|{c}")]
+               for c in get_clients()]
     await update.message.reply_text(
         "👋 Select Client:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-# ======================================================
-# BUTTON FLOW
-# ======================================================
-
-async def show_projects(query, user_id):
-    client = user_state[user_id]["client"]
-    buttons = [
-        [InlineKeyboardButton(p, callback_data=f"project|{p}")]
-        for p in get_projects(client)
-    ]
-    buttons.append([
-        InlineKeyboardButton("⬅ Back", callback_data="back"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-    ])
-    await query.edit_message_text(
-        f"Client: *{client}*\nSelect Project:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
-    )
-
-async def show_tasks(query, user_id):
-    buttons = [
-        [InlineKeyboardButton(t, callback_data=f"task|{t}")]
-        for t in get_tasks()
-    ]
-    buttons.append([
-        InlineKeyboardButton("⬅ Back", callback_data="back"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-    ])
-    await query.edit_message_text(
-        "Select Task:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user_id = query.from_user.id
+    uid = query.from_user.id
     data = query.data.split("|")
 
-    if data[0] == "cancel":
-        user_state.pop(user_id, None)
-        await query.edit_message_text("❌ Cancelled")
-        return
-
-    if data[0] == "back":
-        step = user_state.get(user_id, {}).get("step")
-        if step == "task":
-            await show_projects(query, user_id)
-        else:
-            await start_cmd(update, context)
-        return
-
     if data[0] == "client":
-        user_state[user_id] = {"client": data[1], "step": "project"}
-        await show_projects(query, user_id)
-
-    elif data[0] == "project":
-        user_state[user_id]["project"] = data[1]
-        user_state[user_id]["step"] = "task"
-        await show_tasks(query, user_id)
-
-    elif data[0] == "task":
-        user_state[user_id]["task"] = data[1]
-        user_state[user_id]["step"] = "batch"
+        user_state[uid] = {"client": data[1], "step": "project"}
+        buttons = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
+                   for p in get_projects(data[1])]
         await query.edit_message_text(
-            f"Enter batch name for *{data[1]}*:",
-            parse_mode="Markdown",
+            "Select Project:",
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-# ======================================================
-# TEXT INPUT (BATCH + QTY)
-# ======================================================
+    elif data[0] == "project":
+        user_state[uid]["project"] = data[1]
+        user_state[uid]["step"] = "task"
+        buttons = [[InlineKeyboardButton(t, callback_data=f"task|{t}")]
+                   for t in get_tasks()]
+        await query.edit_message_text(
+            "Select Task:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data[0] == "task":
+        user_state[uid]["task"] = data[1]
+        user_state[uid]["step"] = "batch"
+        await query.edit_message_text("Enter batch name:")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_state:
+    uid = update.effective_user.id
+    if uid not in user_state:
         return
 
-    state = user_state[user_id]
+    state = user_state[uid]
 
     if state["step"] == "batch":
-        state["batch"] = update.message.text.strip()
+        state["batch"] = update.message.text
         state["step"] = "qty"
-        await update.message.reply_text("Enter quantity completed:")
+        await update.message.reply_text("Enter quantity:")
         return
 
     if state["step"] == "qty":
-        try:
-            qty = float(update.message.text)
-        except ValueError:
-            await update.message.reply_text("❌ Enter a number")
-            return
-
+        qty = float(update.message.text)
         add_quantity(state["client"], state["project"], state["task"], qty)
 
         logs_ws().append_row(
@@ -233,49 +179,52 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value_input_option="USER_ENTERED",
         )
 
-        await update.message.reply_text(
-            f"✅ {state['task']} | Batch {state['batch']} updated by {qty}"
-        )
-
-        user_state.pop(user_id, None)
+        await update.message.reply_text("✅ Updated")
+        user_state.pop(uid, None)
 
 # ======================================================
-# HEALTH CHECK (UPTIMEROBOT)
+# HEALTH SERVER (INDEPENDENT)
 # ======================================================
 
 async def health(request):
     return web.Response(text="OK")
 
-async def post_init(application: Application):
-    application.web_app.router.add_get("/", health)
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
+    await site.start()
 
 # ======================================================
 # MAIN
 # ======================================================
 
-def main():
-    app = (
-        Application.builder()
-        .token(os.environ["TELEGRAM_TOKEN"])
-        .post_init(post_init)
-        .build()
+async def main():
+    await start_health_server()
+
+    application = Application.builder().token(
+        os.environ["TELEGRAM_TOKEN"]
+    ).build()
+
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    await application.bot.set_webhook(
+        f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    PORT = int(os.environ.get("PORT", 10000))
-    URL = os.environ["RENDER_EXTERNAL_URL"]
-
-    print("🚀 Bot running (PTB 20.7 + Webhooks + Health Check)")
-
-    app.run_webhook(
+    await application.initialize()
+    await application.start()
+    await application.updater.start_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=int(os.environ.get("PORT", 10000)),
         url_path=os.environ["TELEGRAM_TOKEN"],
-        webhook_url=f"{URL}/{os.environ['TELEGRAM_TOKEN']}",
     )
+
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
