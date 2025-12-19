@@ -6,9 +6,15 @@ from datetime import datetime, timezone, timedelta
 import gspread
 from google.oauth2 import service_account
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # ================= GOOGLE SHEETS =================
 
@@ -25,12 +31,11 @@ def get_client():
 def sheet():
     return get_client().open(os.environ.get("SHEET_NAME", "ProgressLog"))
 
-def logs_ws():
-    return sheet().worksheet("Logs")
-
 def summary_ws():
     return sheet().worksheet("Summary")
 
+def logs_ws():
+    return sheet().worksheet("Logs")
 
 # ================= HELPERS =================
 
@@ -41,17 +46,39 @@ def now_ist():
 def headers():
     return summary_ws().row_values(1)
 
+def get_clients():
+    ws = summary_ws()
+    values = ws.col_values(1)[1:]
+    return sorted(set(v for v in values if v))
+
+def get_projects(client):
+    rows = summary_ws().get_all_values()[1:]
+    return sorted(set(r[1] for r in rows if r and r[0] == client))
+
+def get_tasks():
+    hdr = headers()
+    tasks = []
+    for h in hdr:
+        if h.endswith("Plan"):
+            continue
+        if h in ("Client", "Project", "Tasks", "Completed", "Status (%)"):
+            continue
+        tasks.append(h)
+    return tasks
+
 def find_row(client, project):
     rows = summary_ws().get_all_values()
     for i, r in enumerate(rows[1:], start=2):
-        if len(r) >= 2:
-            if r[0].strip().lower() == client.lower() and r[1].strip().lower() == project.lower():
-                return i
+        if len(r) >= 2 and r[0] == client and r[1] == project:
+            return i
     return None
 
 def ensure_row(client, project):
     if not find_row(client, project):
-        summary_ws().append_row([client, project] + [0] * (len(headers()) - 2))
+        summary_ws().append_row(
+            [client, project] + [0] * (len(headers()) - 2),
+            value_input_option="USER_ENTERED",
+        )
 
 def add_quantity(client, project, task, qty):
     ws = summary_ws()
@@ -60,7 +87,7 @@ def add_quantity(client, project, task, qty):
     hdr = headers()
 
     if task not in hdr:
-        return False, f"Task '{task}' not found in Summary"
+        return False, "Task not found"
 
     col = hdr.index(task) + 1
     current = ws.cell(row, col).value
@@ -68,105 +95,130 @@ def add_quantity(client, project, task, qty):
     ws.update_cell(row, col, current + qty)
     return True, None
 
+# ================= USER STATE =================
 
-# ================= BACKGROUND WORK =================
-
-async def process_qty(update, client, project, task, qty):
-    add_quantity(client, project, task, qty)
-    logs_ws().append_row(
-        [now_ist(), update.effective_user.username or "", client, project, f"{task} +{qty}"],
-        value_input_option="USER_ENTERED",
-    )
-
-async def process_log(update, client, project, desc):
-    logs_ws().append_row(
-        [now_ist(), update.effective_user.username or "", client, project, desc],
-        value_input_option="USER_ENTERED",
-    )
-
+user_state = {}
 
 # ================= COMMANDS =================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state.pop(update.effective_user.id, None)
+
+    buttons = [
+        [InlineKeyboardButton(c, callback_data=f"client|{c}")]
+        for c in get_clients()
+    ]
+
     await update.message.reply_text(
-        "👋 *Welcome to Progress Tracking Bot*\n\n"
-        "Commands:\n"
-        "/log Client | Project | description\n"
-        "/qty Client | Project | Task | +number\n"
-        "/status Client | Project\n\n"
-        "Example:\n"
-        "/qty Oepl | moil | Raw Material | +10",
+        "👋 Select Client:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+# ================= BUTTON FLOW =================
+
+async def show_projects(query, user_id):
+    client = user_state[user_id]["client"]
+    buttons = [
+        [InlineKeyboardButton(p, callback_data=f"project|{p}")]
+        for p in get_projects(client)
+    ]
+    buttons.append([
+        InlineKeyboardButton("⬅ Back", callback_data="back"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    ])
+
+    await query.edit_message_text(
+        f"Client: *{client}*\nSelect Project:",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
     )
 
-async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if "|" not in text:
-        await update.message.reply_text(
-            "Use:\n/log Client | Project | description"
-        )
+async def show_tasks(query, user_id):
+    buttons = [
+        [InlineKeyboardButton(t, callback_data=f"task|{t}")]
+        for t in get_tasks()
+    ]
+    buttons.append([
+        InlineKeyboardButton("⬅ Back", callback_data="back"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    ])
+
+    await query.edit_message_text(
+        "Select Task:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data.split("|")
+
+    if data[0] == "cancel":
+        user_state.pop(user_id, None)
+        await query.edit_message_text("❌ Cancelled")
         return
 
-    client, project, desc = [x.strip() for x in text.split("|", 2)]
-
-    # ACK immediately
-    await update.message.reply_text("✅ Logged")
-
-    asyncio.create_task(process_log(update, client, project, desc))
-
-async def qty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /qty Client | Project | Task | +number
-    """
-    text = " ".join(context.args)
-    if text.count("|") < 3:
-        await update.message.reply_text(
-            "Use:\n/qty Client | Project | Task | +number"
-        )
+    if data[0] == "back":
+        step = user_state.get(user_id, {}).get("step")
+        if step == "project":
+            await start_cmd(update, context)
+        elif step == "task":
+            await show_projects(query, user_id)
         return
 
-    client, project, task, qty = [x.strip() for x in text.split("|", 3)]
+    if data[0] == "client":
+        user_state[user_id] = {"client": data[1], "step": "project"}
+        await show_projects(query, user_id)
+
+    elif data[0] == "project":
+        user_state[user_id]["project"] = data[1]
+        user_state[user_id]["step"] = "task"
+        await show_tasks(query, user_id)
+
+    elif data[0] == "task":
+        user_state[user_id]["task"] = data[1]
+        user_state[user_id]["step"] = "qty"
+        await query.edit_message_text(
+            f"Enter quantity completed for *{data[1]}*:",
+            parse_mode="Markdown",
+        )
+
+# ================= QUANTITY INPUT =================
+
+async def qty_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_state:
+        return
+    if user_state[user_id].get("step") != "qty":
+        return
 
     try:
-        qty = float(qty.replace("+", "").strip())
+        qty = float(update.message.text)
     except ValueError:
-        await update.message.reply_text("❌ Quantity must be a number")
+        await update.message.reply_text("❌ Please enter a number only")
         return
 
-    # ACK fast
-    await update.message.reply_text("✅ Updating quantity…")
+    s = user_state[user_id]
+    add_quantity(s["client"], s["project"], s["task"], qty)
 
-    asyncio.create_task(process_qty(update, client, project, task, qty))
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if "|" not in text:
-        await update.message.reply_text(
-            "Use:\n/status Client | Project"
-        )
-        return
-
-    client, project = [x.strip() for x in text.split("|", 1)]
-    ws = summary_ws()
-    row = find_row(client, project)
-
-    if not row:
-        await update.message.reply_text("❌ Project not found")
-        return
-
-    hdr = headers()
-    tasks = ws.cell(row, hdr.index("Tasks") + 1).value
-    completed = ws.cell(row, hdr.index("Completed") + 1).value
-    status = ws.cell(row, hdr.index("Status (%)") + 1).value
-
-    await update.message.reply_text(
-        f"📊 *{client} / {project}*\n"
-        f"Tasks: {tasks}\n"
-        f"Completed: {completed}\n"
-        f"Status: {status}",
-        parse_mode="Markdown",
+    logs_ws().append_row(
+        [
+            now_ist(),
+            update.effective_user.username or "",
+            s["client"],
+            s["project"],
+            f"{s['task']} +{qty}",
+        ],
+        value_input_option="USER_ENTERED",
     )
 
+    await update.message.reply_text(
+        f"✅ {s['task']} updated by {qty}"
+    )
+
+    user_state.pop(user_id, None)
 
 # ================= MAIN =================
 
@@ -174,14 +226,13 @@ def main():
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("log", log_cmd))
-    app.add_handler(CommandHandler("qty", qty_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, qty_text_handler))
 
     PORT = int(os.environ.get("PORT", 10000))
     URL = os.environ["RENDER_EXTERNAL_URL"]
 
-    print("🚀 Bot starting in WEBHOOK mode (FREE Render)")
+    print("🚀 Bot running with dynamic buttons (FREE Render)")
 
     app.run_webhook(
         listen="0.0.0.0",
@@ -189,7 +240,6 @@ def main():
         url_path=os.environ["TELEGRAM_TOKEN"],
         webhook_url=f"{URL}/{os.environ['TELEGRAM_TOKEN']}",
     )
-
 
 if __name__ == "__main__":
     main()
