@@ -1,56 +1,53 @@
 import os
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+import asyncio
 from aiohttp import web
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================
-# Handlers
+# Telegram Handlers
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Bot is alive!\n\n/start command received successfully."
-    )
+    await update.message.reply_text("✅ Bot is alive and responding!")
+
+# =========================
+# Health Endpoint
+# =========================
 
 async def health(request):
     return web.Response(text="OK")
 
 # =========================
-# Main
+# Main Runner
 # =========================
 
-def main():
-    TOKEN = os.environ.get("TELEGRAM_TOKEN")
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN not set")
-
+async def main():
+    TOKEN = os.environ["TELEGRAM_TOKEN"]
     PORT = int(os.environ.get("PORT", 10000))
-    BASE_URL = os.environ.get("RENDER_EXTERNAL_URL")
+    BASE_URL = os.environ["RENDER_EXTERNAL_URL"]
 
-    if not BASE_URL:
-        raise RuntimeError("RENDER_EXTERNAL_URL not set")
+    # ---- Telegram app ----
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
 
-    app = Application.builder().token(TOKEN).build()
+    # ---- Aiohttp app (health check) ----
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
 
-    # Register command
-    app.add_handler(CommandHandler("start", start))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-    # ---- Health endpoint for Render / UptimeRobot ----
-    app.web_app.router.add_get("/", health)
+    print("🚀 Bot + Health server running")
 
-    print("🚀 Bot running (minimal webhook test)")
+    # ---- Start Telegram webhook ----
+    await application.bot.set_webhook(f"{BASE_URL}/{TOKEN}")
 
-    # ---- Webhook ----
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"{BASE_URL}/{TOKEN}",
-    )
+    await application.initialize()
+    await application.start()
+    await application.stop_when_idle()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
