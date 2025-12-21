@@ -49,7 +49,7 @@ def norm(v):
 
 def safe_int(v):
     try:
-        return int(v)
+        return int(float(v))
     except:
         return 0
 
@@ -141,10 +141,13 @@ async def show_processes(update, context):
           for p in actual_columns()]
 
     kb.append([
-        InlineKeyboardButton("📊 %", callback_data="status"),
-        InlineKeyboardButton("❌ Undo", callback_data="undo"),
+        InlineKeyboardButton("📦 Item %", callback_data="item_status"),
+        InlineKeyboardButton("📂 Project %", callback_data="project_status"),
     ])
-    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
+    kb.append([
+        InlineKeyboardButton("❌ Undo", callback_data="undo"),
+        InlineKeyboardButton("⬅ Back", callback_data="back_items"),
+    ])
 
     await update.effective_message.edit_text(
         "⚙ Select Process",
@@ -197,8 +200,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "undo":
         await undo_last(update, context)
 
-    elif data == "status":
-        await show_status(update, context)
+    elif data == "item_status":
+        await show_item_status(update, context)
+
+    elif data == "project_status":
+        await show_project_status(update, context)
 
     elif data == "back_clients":
         await show_clients(update, edit=True)
@@ -249,7 +255,53 @@ async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_clients(update)
 
 # =========================
-# Extra Features
+# Status (Sheet-driven)
+# =========================
+
+async def show_item_status(update, context):
+    row = find_row(
+        context.user_data["client"],
+        context.user_data["project"],
+        context.user_data["item"],
+    )
+
+    tasks = safe_int(summary.cell(row, col_index("Tasks")).value)
+    completed = safe_int(summary.cell(row, col_index("Completed")).value)
+    status = summary.cell(row, col_index("Status (%)")).value
+
+    await update.effective_message.edit_text(
+        f"📦 Item Status\n\n"
+        f"Tasks: {tasks}\n"
+        f"Completed: {completed}\n"
+        f"Status: {status}"
+    )
+
+async def show_project_status(update, context):
+    client = context.user_data["client"]
+    project = context.user_data["project"]
+
+    records = summary.get_all_records()
+    total_tasks = 0
+    total_completed = 0
+
+    for r in records:
+        if norm(r.get("Client")) == norm(client) and norm(r.get("Project")) == norm(project):
+            total_tasks += safe_int(r.get("Tasks"))
+            total_completed += safe_int(r.get("Completed"))
+
+    percent = (total_completed / total_tasks * 100) if total_tasks else 0
+
+    await update.effective_message.edit_text(
+        f"📂 Project Status\n\n"
+        f"Client: {client}\n"
+        f"Project: {project}\n\n"
+        f"Tasks: {total_tasks}\n"
+        f"Completed: {total_completed}\n"
+        f"Status: {percent:.2f} %"
+    )
+
+# =========================
+# Undo
 # =========================
 
 async def undo_last(update, context):
@@ -266,31 +318,6 @@ async def undo_last(update, context):
 
     summary.update_cell(row, col_index(last_proc), 0)
     await update.effective_message.edit_text(f"❌ Undone: {last_proc}")
-
-async def show_status(update, context):
-    row = find_row(
-        context.user_data["client"],
-        context.user_data["project"],
-        context.user_data["item"],
-    )
-
-    total_plan = 0
-    total_actual = 0
-
-    for h in HEADERS:
-        if is_plan(h):
-            total_plan += safe_int(summary.cell(row, col_index(h)).value)
-        elif h in actual_columns():
-            total_actual += safe_int(summary.cell(row, col_index(h)).value)
-
-    percent = (total_actual / total_plan * 100) if total_plan else 0
-
-    await update.effective_message.edit_text(
-        f"📊 Status\n\n"
-        f"Completed: {total_actual}\n"
-        f"Planned: {total_plan}\n\n"
-        f"✅ {percent:.2f} %"
-    )
 
 # =========================
 # Webhook / Server
