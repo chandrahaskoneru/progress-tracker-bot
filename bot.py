@@ -24,7 +24,11 @@ from telegram.ext import (
 # Google Sheets setup (ENV BASED – Render SAFE)
 # ==================================================
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 
 service_account_info = json.loads(
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
