@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from datetime import datetime
 from aiohttp import web
 
 import gspread
@@ -21,7 +22,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets only – NO Drive API)
+# Google Sheets (Sheets API ONLY)
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -33,9 +34,9 @@ creds = Credentials.from_service_account_info(
 
 gc = gspread.authorize(creds)
 
-summary = gc.open_by_key(os.environ["SHEET_ID"]).worksheet(
-    os.environ.get("SHEET_TAB", "Summary")
-)
+spreadsheet = gc.open_by_key(os.environ["SHEET_ID"])
+summary = spreadsheet.worksheet(os.environ.get("SHEET_TAB", "Summary"))
+logs = spreadsheet.worksheet("Logs")
 
 HEADERS = summary.row_values(1)
 
@@ -46,22 +47,23 @@ HEADERS = summary.row_values(1)
 def norm(v):
     return str(v).strip().lower()
 
+def get_records():
+    return summary.get_all_records()
+
 def get_clients():
-    return sorted(
-        {norm(r["Client"]).title() for r in summary.get_all_records() if r.get("Client")}
-    )
+    return sorted({r["Client"].strip() for r in get_records() if r.get("Client")})
 
 def get_projects(client):
     return sorted({
         r["Project"].strip()
-        for r in summary.get_all_records()
+        for r in get_records()
         if norm(r.get("Client")) == norm(client) and r.get("Project")
     })
 
 def get_items(client, project):
     return sorted({
         r["Item Description"].strip()
-        for r in summary.get_all_records()
+        for r in get_records()
         if norm(r.get("Client")) == norm(client)
         and norm(r.get("Project")) == norm(project)
         and r.get("Item Description")
@@ -69,14 +71,20 @@ def get_items(client, project):
 
 def get_process_columns():
     ignore = ("plan", "tasks", "completed", "status")
-    return [
-        h for h in HEADERS
-        if h and not any(x in h.lower() for x in ignore)
-        and h not in ("Client", "Project", "Item Description")
-    ]
+    processes = []
+    for h in HEADERS:
+        if not h:
+            continue
+        hl = h.lower()
+        if h in ("Client", "Project", "Item Description"):
+            continue
+        if any(x in hl for x in ignore):
+            continue
+        processes.append(h)
+    return processes
 
 def find_row(client, project, item):
-    for i, r in enumerate(summary.get_all_records(), start=2):
+    for i, r in enumerate(get_records(), start=2):
         if (
             norm(r.get("Client")) == norm(client)
             and norm(r.get("Project")) == norm(project)
@@ -94,10 +102,16 @@ def col_index(col):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    buttons = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in get_clients()]
+    clients = get_clients()
+
+    if not clients:
+        await update.message.reply_text("❌ No clients found.")
+        return
+
+    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in clients]
     await update.message.reply_text(
         "📁 Select Client:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,8 +122,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data[0] == "client":
         context.user_data["client"] = data[1]
         projects = get_projects(data[1])
+
         kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
+
         await q.edit_message_text(
             f"Client: {data[1]}\n📂 Select Project:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -118,8 +134,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "project":
         context.user_data["project"] = data[1]
         items = get_items(context.user_data["client"], data[1])
+
         kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")] for i in items]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
+
         await q.edit_message_text(
             f"Project: {data[1]}\n📦 Select Item:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -128,8 +146,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "item":
         context.user_data["item"] = data[1]
         processes = get_process_columns()
+
         kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")] for p in processes]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
+
         await q.edit_message_text(
             f"Item: {data[1]}\n⚙ Select Process:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -145,14 +165,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
 
     elif data[0] == "back_projects":
-        await buttons(
-            Update(update.update_id, callback_query=q._replace(data=f"client|{context.user_data['client']}")),
-            context,
-        )
+        await start(update, context)
 
     elif data[0] == "back_items":
+        client = context.user_data["client"]
         await buttons(
-            Update(update.update_id, callback_query=q._replace(data=f"project|{context.user_data['project']}")),
+            Update(update.update_id, callback_query=q._replace(data=f"client|{client}")),
             context,
         )
 
@@ -166,26 +184,37 @@ async def quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Enter a valid number")
         return
 
-    row = find_row(
-        context.user_data["client"],
-        context.user_data["project"],
-        context.user_data["item"],
-    )
+    client = context.user_data["client"]
+    project = context.user_data["project"]
+    item = context.user_data["item"]
+    process = context.user_data["process"]
 
-    col = col_index(context.user_data["process"])
-    current = summary.cell(row, col).value
-    current = int(current) if current and current.isdigit() else 0
+    row = find_row(client, project, item)
+    col = col_index(process)
 
-    summary.update_cell(row, col, current + qty)
+    current_val = summary.cell(row, col).value
+    current = int(current_val) if current_val and str(current_val).isdigit() else 0
+
+    new_val = current + qty
+    summary.update_cell(row, col, new_val)
+
+    # ===== LOG ENTRY =====
+    logs.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        update.effective_user.username or "",
+        client,
+        project,
+        item,
+    ])
 
     await update.message.reply_text(
-        f"✅ Updated {context.user_data['process']} → {current + qty}"
+        f"✅ Updated\n{process}: {current} → {new_val}"
     )
 
     context.user_data.pop("process")
 
 # =========================
-# Webhook (aiohttp)
+# Webhook
 # =========================
 
 async def health(request):
@@ -218,7 +247,9 @@ async def main():
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await web.TCPSite(
+        runner, "0.0.0.0", int(os.environ.get("PORT", 10000))
+    ).start()
 
     await app.bot.set_webhook(
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
