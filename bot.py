@@ -3,167 +3,135 @@ import json
 import asyncio
 from aiohttp import web
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
-
 import gspread
 from google.oauth2.service_account import Credentials
 
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # =========================
-# Google Sheets Setup
+# Google Sheets
 # =========================
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-creds_dict = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+    scopes=SCOPES,
+)
+
 gc = gspread.authorize(creds)
-
 sheet = gc.open(os.environ["SHEET_NAME"]).worksheet(os.environ["SHEET_TAB"])
 
+# =========================
+# Helpers
+# =========================
 
-def get_rows():
+def get_clients():
     rows = sheet.get_all_values()[1:]  # skip header
-    cleaned = []
-    for r in rows:
-        if len(r) >= 2 and r[0].strip() and r[1].strip():
-            cleaned.append([c.strip() for c in r])
-    return cleaned
+    clients = []
 
+    for r in rows:
+        if len(r) >= 2:
+            client = r[0].strip()
+            project = r[1].strip()
+            if client and project:
+                clients.append(client)
+
+    return sorted(set(clients))
+
+def get_projects(client):
+    rows = sheet.get_all_values()[1:]
+    projects = []
+
+    for r in rows:
+        if len(r) >= 2:
+            if r[0].strip() == client and r[1].strip():
+                projects.append(r[1].strip())
+
+    return sorted(set(projects))
 
 # =========================
 # Telegram Handlers
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_rows()
-    clients = sorted({r[0] for r in rows})
+    clients = get_clients()
 
     if not clients:
         await update.message.reply_text("❌ No clients found in sheet.")
         return
 
-    keyboard = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in clients]
+    keyboard = [[c] for c in clients]
+    keyboard.append(["❌ Cancel"])
+
     await update.message.reply_text(
         "👋 Select Client:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard, resize_keyboard=True
+        ),
     )
 
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
 
-async def client_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    if text == "❌ Cancel":
+        context.user_data.clear()
+        await update.message.reply_text("Cancelled.")
+        return
 
-    client = query.data.split("|", 1)[1]
-    context.user_data["client"] = client
+    clients = get_clients()
 
-    rows = get_rows()
-    projects = sorted({r[1] for r in rows if r[0] == client})
+    # Client selected
+    if text in clients:
+        context.user_data["client"] = text
+        projects = get_projects(text)
 
-    keyboard = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
-    keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
+        keyboard = [[p] for p in projects]
+        keyboard.append(["⬅ Back"])
 
-    await query.edit_message_text(
-        f"📁 Client: {client}\nSelect Project:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def project_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    project = query.data.split("|", 1)[1]
-    context.user_data["project"] = project
-
-    processes = [
-        "Raw Material",
-        "Rough Turning",
-        "Heat treatment",
-        "Final Machining",
-        "Keyway",
-        "GC",
-        "Spline",
-        "CG",
-        "SG",
-        "IH",
-        "GG",
-    ]
-
-    keyboard = [
-        [InlineKeyboardButton(p, callback_data=f"process|{p}")]
-        for p in processes
-    ]
-    keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
-
-    await query.edit_message_text(
-        f"📂 Project: {project}\nSelect Process:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def process_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    process = query.data.split("|", 1)[1]
-    client = context.user_data["client"]
-    project = context.user_data["project"]
-
-    await query.edit_message_text(
-        f"✅ Logged\n\nClient: {client}\nProject: {project}\nProcess: {process}"
-    )
-
-
-async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "back_clients":
-        await start(update, context)
-
-    elif query.data == "back_projects":
-        client = context.user_data.get("client")
-        rows = get_rows()
-        projects = sorted({r[1] for r in rows if r[0] == client})
-
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
-
-        await query.edit_message_text(
-            f"📁 Client: {client}\nSelect Project:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+        await update.message.reply_text(
+            f"📁 Client: {text}\nSelect Project:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard, resize_keyboard=True
+            ),
         )
+        return
 
+    # Back
+    if text == "⬅ Back":
+        await start(update, context)
+        return
+
+    # Project selected
+    if "client" in context.user_data:
+        await update.message.reply_text(
+            f"✅ Selected\n\n"
+            f"Client: {context.user_data['client']}\n"
+            f"Project: {text}\n\n"
+            f"(Next step: quantity buttons)"
+        )
+    else:
+        await update.message.reply_text("Use /start")
 
 # =========================
-# Aiohttp (Webhook)
+# Webhook
 # =========================
 
 async def health(request):
     return web.Response(text="OK")
 
-
 async def telegram_webhook(request):
-    telegram_app: Application = request.app["telegram_app"]
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    tg_app: Application = request.app["telegram_app"]
+    update = Update.de_json(await request.json(), tg_app.bot)
+    await tg_app.process_update(update)
     return web.Response(text="OK")
-
 
 # =========================
 # Main
@@ -175,12 +143,8 @@ async def main():
     BASE_URL = os.environ["RENDER_EXTERNAL_URL"]
 
     telegram_app = Application.builder().token(TOKEN).build()
-
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(client_selected, pattern="^client\\|"))
-    telegram_app.add_handler(CallbackQueryHandler(project_selected, pattern="^project\\|"))
-    telegram_app.add_handler(CallbackQueryHandler(process_selected, pattern="^process\\|"))
-    telegram_app.add_handler(CallbackQueryHandler(back_handler, pattern="^back_"))
+    telegram_app.add_handler(MessageHandler(filters.TEXT, text_handler))
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -192,14 +156,12 @@ async def main():
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
     await telegram_app.bot.set_webhook(f"{BASE_URL}/{TOKEN}")
 
-    print("🚀 Bot running (Webhook + Google Sheets + Buttons)")
+    print("🚀 Bot running (Webhook + Buttons)")
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
