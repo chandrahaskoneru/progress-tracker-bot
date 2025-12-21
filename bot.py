@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets API ONLY)
+# Google Sheets setup
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -35,7 +35,7 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 
 spreadsheet = gc.open_by_key(os.environ["SHEET_ID"])
-summary = spreadsheet.worksheet(os.environ.get("SHEET_TAB", "Summary"))
+summary = spreadsheet.worksheet("Summary")
 logs = spreadsheet.worksheet("Logs")
 
 HEADERS = summary.row_values(1)
@@ -53,35 +53,17 @@ def safe_int(v):
     except:
         return 0
 
-def get_clients():
-    return sorted({
-        r["Client"].strip()
-        for r in summary.get_all_records()
-        if r.get("Client")
-    })
+def col_index(col):
+    return HEADERS.index(col) + 1
 
-def get_projects(client):
-    return sorted({
-        r["Project"].strip()
-        for r in summary.get_all_records()
-        if norm(r.get("Client")) == norm(client) and r.get("Project")
-    })
+def is_plan(col):
+    return col.lower().endswith("plan")
 
-def get_items(client, project):
-    return sorted({
-        r["Item Description"].strip()
-        for r in summary.get_all_records()
-        if norm(r.get("Client")) == norm(client)
-        and norm(r.get("Project")) == norm(project)
-        and r.get("Item Description")
-    })
-
-def get_process_columns():
-    ignore = ("plan", "tasks", "completed", "status")
+def actual_columns():
     return [
         h for h in HEADERS
-        if h and h not in ("Client", "Project", "Item Description")
-        and not any(x in h.lower() for x in ignore)
+        if h not in ("Client", "Project", "Item Description", "Tasks", "Completed", "Status (%)")
+        and not is_plan(h)
     ]
 
 def find_row(client, project, item):
@@ -94,75 +76,98 @@ def find_row(client, project, item):
             return i
     return None
 
-def col_index(col):
-    return HEADERS.index(col) + 1
+def find_last_filled_process(row):
+    for col in reversed(actual_columns()):
+        if safe_int(summary.cell(row, col_index(col)).value) > 0:
+            return col
+    return None
 
 # =========================
-# UI Screens (SAFE)
+# UI Screens
 # =========================
 
-async def show_clients(update, context, edit=False):
-    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")]
-          for c in get_clients()]
+async def show_clients(update, edit=False):
+    clients = sorted({
+        r["Client"] for r in summary.get_all_records() if r.get("Client")
+    })
+    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in clients]
 
     if edit:
         await update.effective_message.edit_text(
-            "📁 Select Client:",
+            "📁 Select Client",
             reply_markup=InlineKeyboardMarkup(kb),
         )
     else:
         await update.message.reply_text(
-            "📁 Select Client:",
+            "📁 Select Client",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
 async def show_projects(update, context):
     client = context.user_data["client"]
-    kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
-          for p in get_projects(client)]
+    projects = sorted({
+        r["Project"] for r in summary.get_all_records()
+        if norm(r.get("Client")) == norm(client)
+    })
+
+    kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
 
     await update.effective_message.edit_text(
-        f"Client: {client}\n📂 Select Project:",
+        f"📂 Client: {client}",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def show_items(update, context):
     client = context.user_data["client"]
     project = context.user_data["project"]
-    kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
-          for i in get_items(client, project)]
+
+    items = sorted({
+        r["Item Description"] for r in summary.get_all_records()
+        if norm(r.get("Client")) == norm(client)
+        and norm(r.get("Project")) == norm(project)
+    })
+
+    kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")] for i in items]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
 
     await update.effective_message.edit_text(
-        f"Project: {project}\n📦 Select Item:",
+        f"📦 Project: {project}",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def show_processes(update, context):
-    kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
-          for p in get_process_columns()]
+    kb = [[InlineKeyboardButton(p.replace(" ", ""), callback_data=f"proc|{p}")]
+          for p in actual_columns()]
+
+    kb.append([
+        InlineKeyboardButton("📊 %", callback_data="status"),
+        InlineKeyboardButton("❌ Undo", callback_data="undo"),
+    ])
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
 
     await update.effective_message.edit_text(
-        "⚙ Select Process:",
+        "⚙ Select Process",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def ask_quantity(update, context):
-    kb = [[InlineKeyboardButton("⬅ Back", callback_data="back_processes")]]
+    kb = [
+        [InlineKeyboardButton("🔄 Edit Qty", callback_data="edit_qty")],
+        [InlineKeyboardButton("⬅ Back", callback_data="back_processes")],
+    ]
     await update.effective_message.edit_text(
-        f"✏ Enter quantity for {context.user_data['process']}:",
+        f"✏ Enter quantity for {context.user_data['process']}",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 # =========================
-# Telegram Handlers
+# Commands & Buttons
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await show_clients(update, context, edit=False)
+    await show_clients(update)
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -170,23 +175,33 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     if data.startswith("client|"):
-        context.user_data["client"] = data.split("|", 1)[1]
+        context.user_data["client"] = data.split("|")[1]
         await show_projects(update, context)
 
     elif data.startswith("project|"):
-        context.user_data["project"] = data.split("|", 1)[1]
+        context.user_data["project"] = data.split("|")[1]
         await show_items(update, context)
 
     elif data.startswith("item|"):
-        context.user_data["item"] = data.split("|", 1)[1]
+        context.user_data["item"] = data.split("|")[1]
         await show_processes(update, context)
 
     elif data.startswith("proc|"):
-        context.user_data["process"] = data.split("|", 1)[1]
+        context.user_data["process"] = data.split("|")[1]
         await ask_quantity(update, context)
 
+    elif data == "edit_qty":
+        context.user_data["edit_mode"] = True
+        await update.effective_message.edit_text("🔄 Enter corrected quantity:")
+
+    elif data == "undo":
+        await undo_last(update, context)
+
+    elif data == "status":
+        await show_status(update, context)
+
     elif data == "back_clients":
-        await show_clients(update, context, edit=True)
+        await show_clients(update, edit=True)
 
     elif data == "back_projects":
         await show_projects(update, context)
@@ -197,13 +212,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_processes":
         await show_processes(update, context)
 
-async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "process" not in context.user_data:
-        return
+# =========================
+# Quantity Input
+# =========================
 
+async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        qty = int(update.message.text.replace("+", ""))
-    except ValueError:
+        qty = int(update.message.text)
+    except:
         await update.message.reply_text("❌ Enter a valid number")
         return
 
@@ -215,33 +231,70 @@ async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = find_row(client, project, item)
     col = col_index(process)
 
-    current = safe_int(summary.cell(row, col).value)
-    summary.update_cell(row, col, current + qty)
-
-    user = update.effective_user
-    username = (
-        f"@{user.username}" if user.username
-        else user.full_name if user.full_name
-        else str(user.id)
-    )
+    if context.user_data.pop("edit_mode", False):
+        summary.update_cell(row, col, qty)
+    else:
+        current = safe_int(summary.cell(row, col).value)
+        summary.update_cell(row, col, current + qty)
 
     logs.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        username,
+        update.effective_user.username,
         client,
         project,
         item,
     ])
 
-    await update.message.reply_text("✅ Quantity updated & logged")
-    await show_clients(update, context, edit=False)
+    await update.message.reply_text("✅ Quantity updated")
+    await show_clients(update)
 
 # =========================
-# Webhook
+# Extra Features
 # =========================
 
-async def health(request):
-    return web.Response(text="OK")
+async def undo_last(update, context):
+    row = find_row(
+        context.user_data["client"],
+        context.user_data["project"],
+        context.user_data["item"],
+    )
+
+    last_proc = find_last_filled_process(row)
+    if not last_proc:
+        await update.effective_message.edit_text("❌ Nothing to undo")
+        return
+
+    summary.update_cell(row, col_index(last_proc), 0)
+    await update.effective_message.edit_text(f"❌ Undone: {last_proc}")
+
+async def show_status(update, context):
+    row = find_row(
+        context.user_data["client"],
+        context.user_data["project"],
+        context.user_data["item"],
+    )
+
+    total_plan = 0
+    total_actual = 0
+
+    for h in HEADERS:
+        if is_plan(h):
+            total_plan += safe_int(summary.cell(row, col_index(h)).value)
+        elif h in actual_columns():
+            total_actual += safe_int(summary.cell(row, col_index(h)).value)
+
+    percent = (total_actual / total_plan * 100) if total_plan else 0
+
+    await update.effective_message.edit_text(
+        f"📊 Status\n\n"
+        f"Completed: {total_actual}\n"
+        f"Planned: {total_plan}\n\n"
+        f"✅ {percent:.2f} %"
+    )
+
+# =========================
+# Webhook / Server
+# =========================
 
 async def webhook(request):
     app = request.app["telegram_app"]
@@ -249,9 +302,8 @@ async def webhook(request):
     await app.process_update(update)
     return web.Response(text="OK")
 
-# =========================
-# Main
-# =========================
+async def health(request):
+    return web.Response(text="OK")
 
 async def main():
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
@@ -271,14 +323,16 @@ async def main():
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(
-        runner, "0.0.0.0", int(os.environ.get("PORT", 10000))
+        runner,
+        "0.0.0.0",
+        int(os.environ.get("PORT", 10000)),
     ).start()
 
     await app.bot.set_webhook(
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    print("✅ Bot running (edit/reply safe)")
+    print("✅ Bot running successfully")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
