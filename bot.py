@@ -24,30 +24,35 @@ from telegram.ext import (
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
 gc = gspread.authorize(creds)
-sheet = gc.open(os.environ["SHEET_NAME"]).worksheet(os.environ["SHEET_TAB"])
+
+sheet = gc.open_by_key(
+    os.environ["SHEET_ID"]
+).worksheet(os.environ["SHEET_TAB"])
 
 # =========================
-# Sheet helpers
+# Sheet helpers (SAFE)
 # =========================
 
 def get_clients():
-    # Column A = Client
-    values = sheet.col_values(1)[1:]  # skip header
-    return sorted({v.strip() for v in values if v.strip()})
+    # Column A = Client (skip header)
+    col = sheet.col_values(1)[1:]
+    return sorted({c.strip() for c in col if c.strip()})
 
 def get_projects(client):
-    records = sheet.get_all_records()
-    return sorted({
-        r["Project"]
-        for r in records
-        if r.get("Client") == client and r.get("Project")
-    })
+    rows = sheet.get_all_values()[1:]
+    projects = set()
+    for r in rows:
+        if len(r) >= 2 and r[0].strip() == client:
+            if r[1].strip():
+                projects.add(r[1].strip())
+    return sorted(projects)
 
 # =========================
 # Telegram handlers
@@ -81,7 +86,9 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         projects = get_projects(client)
 
         if not projects:
-            await query.edit_message_text("❌ No projects found.")
+            await query.edit_message_text(
+                f"❌ No projects found for {client}"
+            )
             return
 
         keyboard = [
@@ -93,22 +100,20 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await query.edit_message_text(
-            f"Client: {client}\nSelect Project:",
+            f"Client: {client}\n\nSelect Project:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     elif parts[0] == "project":
-        client, project = parts[1], parts[2]
-
         await query.edit_message_text(
-            f"✅ Selected\nClient: {client}\nProject: {project}"
+            f"✅ Selected\n\nClient: {parts[1]}\nProject: {parts[2]}"
         )
 
     elif parts[0] == "back":
         await start(update, context)
 
 # =========================
-# Webhook (aiohttp)
+# Webhook handlers
 # =========================
 
 async def health(request):
@@ -131,7 +136,6 @@ async def main():
     BASE_URL = os.environ["RENDER_EXTERNAL_URL"]
 
     telegram_app = Application.builder().token(TOKEN).build()
-
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CallbackQueryHandler(handle_buttons))
 
@@ -151,7 +155,7 @@ async def main():
 
     await telegram_app.bot.set_webhook(f"{BASE_URL}/{TOKEN}")
 
-    print("✅ Bot running with client & project buttons")
+    print("✅ Bot running with buttons + Google Sheets")
 
     await asyncio.Event().wait()
 
