@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 from aiohttp import web
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -12,7 +13,10 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -35,7 +39,7 @@ SHEET_TAB = os.environ["SHEET_TAB"]
 sheet = gc.open(SHEET_NAME).worksheet(SHEET_TAB)
 
 # =========================
-# Column mapping (Actual qty columns)
+# Column mapping
 # =========================
 
 PROCESS_COLS = {
@@ -62,11 +66,10 @@ STATUS_COL = 27
 # =========================
 
 def get_rows():
-    return sheet.get_all_values()[1:]  # skip header
+    return sheet.get_all_values()[1:]
 
 def find_row(client, project):
-    rows = get_rows()
-    for idx, row in enumerate(rows, start=2):
+    for idx, row in enumerate(get_rows(), start=2):
         if row[0].strip() == client and row[1].strip() == project:
             return idx, row
     return None, None
@@ -89,8 +92,7 @@ def calculate_status(row):
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_rows()
-    clients = sorted(set(r[0] for r in rows if r[0].strip()))
+    clients = sorted({r[0] for r in get_rows() if r[0].strip()})
 
     if not clients:
         await update.message.reply_text("❌ No clients found in sheet.")
@@ -103,53 +105,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def client_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    client = query.data.split("|")[1]
+    client = q.data.split("|")[1]
     context.user_data["client"] = client
 
-    rows = get_rows()
-    projects = sorted(set(r[1] for r in rows if r[0] == client and r[1].strip()))
+    projects = sorted({
+        r[1] for r in get_rows()
+        if r[0] == client and r[1].strip()
+    })
 
     keyboard = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
     keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
 
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"Client: {client}\nSelect Project:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 async def project_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    project = query.data.split("|")[1]
+    project = q.data.split("|")[1]
     context.user_data["project"] = project
 
     keyboard = [
         [InlineKeyboardButton(p, callback_data=f"process|{p}")]
-        for p in PROCESS_COLS.keys()
+        for p in PROCESS_COLS
     ]
     keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
 
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"Project: {project}\nSelect Process:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 async def process_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    process = query.data.split("|")[1]
+    process = q.data.split("|")[1]
     context.user_data["process"] = process
 
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"Process: {process}\nSend quantity like:\n+4"
     )
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def qty_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.text.startswith("+"):
         return
 
@@ -169,7 +173,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_val = current + qty
     sheet.update_cell(row_idx, col, new_val)
 
-    # Update status
     updated_row = sheet.row_values(row_idx)
     completed, status = calculate_status(updated_row)
     sheet.update_cell(row_idx, COMPLETED_COL, completed)
@@ -180,7 +183,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# Aiohttp webhook
+# Webhook (aiohttp)
 # =========================
 
 async def health(request):
@@ -208,19 +211,7 @@ async def main():
     telegram_app.add_handler(CallbackQueryHandler(client_selected, pattern="^client\\|"))
     telegram_app.add_handler(CallbackQueryHandler(project_selected, pattern="^project\\|"))
     telegram_app.add_handler(CallbackQueryHandler(process_selected, pattern="^process\\|"))
-    telegram_app.add_handler(CallbackQueryHandler(start, pattern="^back_clients$"))
-    telegram_app.add_handler(CallbackQueryHandler(client_selected, pattern="^back_projects$"))
-    telegram_app.add_handler(CommandHandler("log", start))
-    telegram_app.add_handler(CommandHandler("clients", start))
-    telegram_app.add_handler(
-        CommandHandler("status", start)
-    )
-    telegram_app.add_handler(
-        telegram.ext.MessageHandler(
-            telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND,
-            text_handler,
-        )
-    )
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, qty_handler))
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -237,7 +228,7 @@ async def main():
 
     await telegram_app.bot.set_webhook(f"{BASE_URL}/{TOKEN}")
 
-    print("🚀 Progress Tracker Bot running (Webhook + Sheets)")
+    print("🚀 Bot running successfully (Webhook + Sheets)")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
