@@ -34,7 +34,6 @@ creds = Credentials.from_service_account_info(
 
 gc = gspread.authorize(creds)
 
-# ✅ OPEN SPREADSHEET ONCE BY ID
 spreadsheet = gc.open_by_key(os.environ["SHEET_ID"])
 summary = spreadsheet.worksheet(os.environ.get("SHEET_TAB", "Summary"))
 logs = spreadsheet.worksheet("Logs")
@@ -99,58 +98,106 @@ def col_index(col):
     return HEADERS.index(col) + 1
 
 # =========================
-# Telegram Flow
+# Telegram Screens
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_clients(update, context):
     context.user_data.clear()
     kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in get_clients()]
-    await update.message.reply_text(
+    await update.effective_message.edit_text(
         "📁 Select Client:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
+async def show_projects(update, context):
+    client = context.user_data["client"]
+    kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
+          for p in get_projects(client)]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
+    await update.effective_message.edit_text(
+        f"Client: {client}\n📂 Select Project:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def show_items(update, context):
+    client = context.user_data["client"]
+    project = context.user_data["project"]
+    kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
+          for i in get_items(client, project)]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
+    await update.effective_message.edit_text(
+        f"Project: {project}\n📦 Select Item:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def show_processes(update, context):
+    item = context.user_data["item"]
+    kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
+          for p in get_process_columns()]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
+    await update.effective_message.edit_text(
+        f"Item: {item}\n⚙ Select Process:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def ask_quantity(update, context):
+    proc = context.user_data["process"]
+    kb = [[InlineKeyboardButton("⬅ Back", callback_data="back_processes")]]
+    await update.effective_message.edit_text(
+        f"✏ Enter quantity for {proc}:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+# =========================
+# Telegram Handlers
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Loading…")
+    await show_clients(update, context)
+
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data.split("|")
+    data = q.data
 
-    if data[0] == "client":
-        context.user_data["client"] = data[1]
-        kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
-              for p in get_projects(data[1])]
-        await q.edit_message_text(
-            "📂 Select Project:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+    if data.startswith("client|"):
+        context.user_data["client"] = data.split("|", 1)[1]
+        await show_projects(update, context)
 
-    elif data[0] == "project":
-        context.user_data["project"] = data[1]
-        kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
-              for i in get_items(context.user_data["client"], data[1])]
-        await q.edit_message_text(
-            "📦 Select Item:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+    elif data.startswith("project|"):
+        context.user_data["project"] = data.split("|", 1)[1]
+        await show_items(update, context)
 
-    elif data[0] == "item":
-        context.user_data["item"] = data[1]
-        kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
-              for p in get_process_columns()]
-        await q.edit_message_text(
-            "⚙ Select Process:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+    elif data.startswith("item|"):
+        context.user_data["item"] = data.split("|", 1)[1]
+        await show_processes(update, context)
 
-    elif data[0] == "proc":
-        context.user_data["process"] = data[1]
-        await q.edit_message_text("✏ Enter quantity:")
+    elif data.startswith("proc|"):
+        context.user_data["process"] = data.split("|", 1)[1]
+        await ask_quantity(update, context)
+
+    elif data == "back_clients":
+        await show_clients(update, context)
+
+    elif data == "back_projects":
+        await show_projects(update, context)
+
+    elif data == "back_items":
+        await show_items(update, context)
+
+    elif data == "back_processes":
+        await show_processes(update, context)
 
 async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "process" not in context.user_data:
         return
 
-    qty = safe_int(update.message.text)
+    try:
+        qty = int(update.message.text.replace("+", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Enter a valid number")
+        return
 
     client = context.user_data["client"]
     project = context.user_data["project"]
@@ -163,7 +210,6 @@ async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = safe_int(summary.cell(row, col).value)
     summary.update_cell(row, col, current + qty)
 
-    # ✅ LOG ENTRY (NO DRIVE API)
     user = update.effective_user
     username = (
         f"@{user.username}" if user.username
@@ -179,8 +225,8 @@ async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item,
     ])
 
-    await update.message.reply_text("✅ Quantity updated and logged.")
-    context.user_data.clear()
+    await update.message.reply_text("✅ Quantity updated and logged")
+    await show_clients(update, context)
 
 # =========================
 # Webhook
@@ -224,7 +270,7 @@ async def main():
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    print("✅ Bot running WITHOUT Drive API")
+    print("✅ Bot running with full Back navigation")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
