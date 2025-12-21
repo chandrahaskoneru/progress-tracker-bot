@@ -22,14 +22,14 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets API ONLY – NO DRIVE)
+# Google Sheets (Sheets API ONLY)
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 creds = Credentials.from_service_account_info(
     json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
-    scopes=SCOPES
+    scopes=SCOPES,
 )
 
 gc = gspread.authorize(creds)
@@ -47,9 +47,9 @@ HEADERS = summary.row_values(1)
 def norm(v):
     return str(v).strip().lower()
 
-def safe_int(val):
+def safe_int(v):
     try:
-        return int(val)
+        return int(v)
     except:
         return 0
 
@@ -98,22 +98,30 @@ def col_index(col):
     return HEADERS.index(col) + 1
 
 # =========================
-# Telegram Screens
+# UI Screens (SAFE)
 # =========================
 
-async def show_clients(update, context):
-    context.user_data.clear()
-    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in get_clients()]
-    await update.effective_message.edit_text(
-        "📁 Select Client:",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+async def show_clients(update, context, edit=False):
+    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")]
+          for c in get_clients()]
+
+    if edit:
+        await update.effective_message.edit_text(
+            "📁 Select Client:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    else:
+        await update.message.reply_text(
+            "📁 Select Client:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
 
 async def show_projects(update, context):
     client = context.user_data["client"]
     kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
           for p in get_projects(client)]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
+
     await update.effective_message.edit_text(
         f"Client: {client}\n📂 Select Project:",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -125,26 +133,26 @@ async def show_items(update, context):
     kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
           for i in get_items(client, project)]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
+
     await update.effective_message.edit_text(
         f"Project: {project}\n📦 Select Item:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def show_processes(update, context):
-    item = context.user_data["item"]
     kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
           for p in get_process_columns()]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
+
     await update.effective_message.edit_text(
-        f"Item: {item}\n⚙ Select Process:",
+        "⚙ Select Process:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def ask_quantity(update, context):
-    proc = context.user_data["process"]
     kb = [[InlineKeyboardButton("⬅ Back", callback_data="back_processes")]]
     await update.effective_message.edit_text(
-        f"✏ Enter quantity for {proc}:",
+        f"✏ Enter quantity for {context.user_data['process']}:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -153,8 +161,8 @@ async def ask_quantity(update, context):
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Loading…")
-    await show_clients(update, context)
+    context.user_data.clear()
+    await show_clients(update, context, edit=False)
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -178,7 +186,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_quantity(update, context)
 
     elif data == "back_clients":
-        await show_clients(update, context)
+        await show_clients(update, context, edit=True)
 
     elif data == "back_projects":
         await show_projects(update, context)
@@ -225,8 +233,8 @@ async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item,
     ])
 
-    await update.message.reply_text("✅ Quantity updated and logged")
-    await show_clients(update, context)
+    await update.message.reply_text("✅ Quantity updated & logged")
+    await show_clients(update, context, edit=False)
 
 # =========================
 # Webhook
@@ -270,7 +278,7 @@ async def main():
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    print("✅ Bot running with full Back navigation")
+    print("✅ Bot running (edit/reply safe)")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
