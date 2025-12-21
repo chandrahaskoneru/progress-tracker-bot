@@ -2,7 +2,6 @@ import os
 import json
 import asyncio
 from aiohttp import web
-from datetime import datetime
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -22,25 +21,31 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets API only)
+# Google Sheets (Sheets API ONLY)
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+    scopes=SCOPES,
+)
+
 gc = gspread.authorize(creds)
 
-sheet = gc.open(os.environ["SHEET_NAME"]).worksheet(os.environ["SHEET_TAB"])
-
-# =========================
-# Helpers
-# =========================
+# 🔴 IMPORTANT: open_by_key (NO DRIVE API)
+sheet = gc.open_by_key(
+    os.environ["SHEET_ID"]
+).worksheet(os.environ["SHEET_TAB"])
 
 HEADERS = sheet.row_values(1)
 
 def col_index(name):
     return HEADERS.index(name) + 1
+
+# =========================
+# Data helpers
+# =========================
 
 def get_clients():
     return sorted({
@@ -53,12 +58,12 @@ def get_projects(client):
     return sorted({
         r["Project"]
         for r in sheet.get_all_records()
-        if r.get("Client") == client and r.get("Project")
+        if r.get("Client") == client
     })
 
 def get_items(client, project):
     return sorted({
-        r.get("Item Description", "").strip()
+        r.get("Item Description", "")
         for r in sheet.get_all_records()
         if r.get("Client") == client and r.get("Project") == project
     })
@@ -97,7 +102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clients = get_clients()
 
     if not clients:
-        await update.message.reply_text("❌ No clients found in sheet.")
+        await update.message.reply_text("❌ No clients found.")
         return
 
     keyboard = [[InlineKeyboardButton(c, callback_data=f"client|{c}")]
@@ -119,7 +124,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
                     for p in projects]
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
+        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
 
         await q.edit_message_text(
             "📁 Select Project:",
@@ -132,7 +137,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
                     for i in items]
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
 
         await q.edit_message_text(
             "📦 Select Item Description:",
@@ -142,70 +146,57 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "item":
         context.user_data["item"] = data[1]
 
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"process|{p}")]
+        keyboard = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
                     for p in PROCESSES]
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
 
         await q.edit_message_text(
             "⚙ Select Process:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-    elif data[0] == "process":
+    elif data[0] == "proc":
         context.user_data["process"] = data[1]
         context.user_data["await_qty"] = True
 
         await q.edit_message_text(
-            f"✏️ Enter quantity to add:\n\n"
-            f"Client: {context.user_data['client']}\n"
-            f"Project: {context.user_data['project']}\n"
-            f"Item: {context.user_data['item']}\n"
-            f"Process: {data[1]}"
+            "✏️ Enter quantity to add (example: +2 or 5)"
         )
-
-    elif data[0].startswith("back"):
-        await start(update, context)
 
 async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("await_qty"):
         return
 
     try:
-        text = update.message.text.strip()
-        qty = int(text.replace("+", ""))   # ✅ FIX: accepts +2
+        qty = int(update.message.text.replace("+", ""))
     except ValueError:
-        await update.message.reply_text("❌ Please enter a valid number (e.g. 2 or +2)")
+        await update.message.reply_text("❌ Enter a number like +2 or 5")
         return
 
-    c = context.user_data["client"]
-    p = context.user_data["project"]
-    i = context.user_data["item"]
-    proc = context.user_data["process"]
+    row = find_row(
+        context.user_data["client"],
+        context.user_data["project"],
+        context.user_data["item"],
+    )
 
-    row = find_row(c, p, i)
-    if not row:
-        await update.message.reply_text("❌ Row not found.")
-        return
-
-    col = col_index(proc)
+    col = col_index(context.user_data["process"])
     current = sheet.cell(row, col).value
     current = int(current) if current else 0
 
     sheet.update_cell(row, col, current + qty)
 
     await update.message.reply_text(
-        f"✅ Updated successfully!\n\n"
-        f"Client: {c}\n"
-        f"Project: {p}\n"
-        f"Item: {i}\n"
-        f"Process: {proc}\n"
-        f"Quantity added: {qty}"
+        f"✅ Updated\n\n"
+        f"Client: {context.user_data['client']}\n"
+        f"Project: {context.user_data['project']}\n"
+        f"Item: {context.user_data['item']}\n"
+        f"Process: {context.user_data['process']}\n"
+        f"Added: {qty}"
     )
 
     context.user_data.clear()
 
 # =========================
-# Webhook (Render)
+# Webhook
 # =========================
 
 async def health(request):
@@ -213,8 +204,7 @@ async def health(request):
 
 async def telegram_webhook(request):
     app = request.app["telegram_app"]
-    data = await request.json()
-    update = Update.de_json(data, app.bot)
+    update = Update.de_json(await request.json(), app.bot)
     await app.process_update(update)
     return web.Response(text="OK")
 
@@ -245,7 +235,7 @@ async def main():
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    print("🚀 Bot fully running")
+    print("🚀 Bot running (NO Drive API)")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
