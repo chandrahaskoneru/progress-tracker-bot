@@ -22,96 +22,76 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets API ONLY)
+# Google Sheets (Sheets API only)
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 creds = Credentials.from_service_account_info(
     json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
-    scopes=SCOPES,
+    scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
 
-spreadsheet = gc.open_by_key(os.environ["SHEET_ID"])
-summary = spreadsheet.worksheet(os.environ.get("SHEET_TAB", "Summary"))
-logs = spreadsheet.worksheet("Logs")
+summary = gc.open_by_key(os.environ["SHEET_ID"]).worksheet(os.environ["SHEET_TAB"])
+logs = gc.open(os.environ["SHEET_NAME"]).worksheet("Logs")
 
 HEADERS = summary.row_values(1)
+
+# Process columns = columns without "Plan" and not meta columns
+EXCLUDE = {"Client", "Project", "Item Description", "Tasks", "Completed", "Status (%)"}
+PROCESS_COLUMNS = [
+    h for h in HEADERS
+    if h and "Plan" not in h and h not in EXCLUDE
+]
 
 # =========================
 # Helpers
 # =========================
 
-def norm(v):
-    return str(v).strip().lower()
-
-def get_records():
-    return summary.get_all_records()
+def safe_int(val):
+    try:
+        return int(val)
+    except:
+        return 0
 
 def get_clients():
-    return sorted({r["Client"].strip() for r in get_records() if r.get("Client")})
+    return sorted(set(summary.col_values(1)[1:]))
 
 def get_projects(client):
-    return sorted({
-        r["Project"].strip()
-        for r in get_records()
-        if norm(r.get("Client")) == norm(client) and r.get("Project")
-    })
+    return sorted(set(
+        r["Project"]
+        for r in summary.get_all_records()
+        if r["Client"] == client
+    ))
 
 def get_items(client, project):
-    return sorted({
-        r["Item Description"].strip()
-        for r in get_records()
-        if norm(r.get("Client")) == norm(client)
-        and norm(r.get("Project")) == norm(project)
-        and r.get("Item Description")
-    })
-
-def get_process_columns():
-    ignore = ("plan", "tasks", "completed", "status")
-    processes = []
-    for h in HEADERS:
-        if not h:
-            continue
-        hl = h.lower()
-        if h in ("Client", "Project", "Item Description"):
-            continue
-        if any(x in hl for x in ignore):
-            continue
-        processes.append(h)
-    return processes
+    return sorted(set(
+        r["Item Description"]
+        for r in summary.get_all_records()
+        if r["Client"] == client and r["Project"] == project
+    ))
 
 def find_row(client, project, item):
-    for i, r in enumerate(get_records(), start=2):
-        if (
-            norm(r.get("Client")) == norm(client)
-            and norm(r.get("Project")) == norm(project)
-            and norm(r.get("Item Description")) == norm(item)
-        ):
+    rows = summary.get_all_values()
+    for i, r in enumerate(rows[1:], start=2):
+        if r[0] == client and r[1] == project and r[2] == item:
             return i
     return None
 
-def col_index(col):
-    return HEADERS.index(col) + 1
-
 # =========================
-# Telegram Flow
+# Telegram Handlers
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    clients = get_clients()
-
-    if not clients:
-        await update.message.reply_text("❌ No clients found.")
-        return
-
-    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in clients]
+    keyboard = [
+        [InlineKeyboardButton(c, callback_data=f"client|{c}")]
+        for c in get_clients()
+    ]
     await update.message.reply_text(
         "📁 Select Client:",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -122,96 +102,80 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data[0] == "client":
         context.user_data["client"] = data[1]
         projects = get_projects(data[1])
-
         kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
-
         await q.edit_message_text(
             f"Client: {data[1]}\n📂 Select Project:",
-            reply_markup=InlineKeyboardMarkup(kb),
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
     elif data[0] == "project":
         context.user_data["project"] = data[1]
         items = get_items(context.user_data["client"], data[1])
-
         kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")] for i in items]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
-
         await q.edit_message_text(
             f"Project: {data[1]}\n📦 Select Item:",
-            reply_markup=InlineKeyboardMarkup(kb),
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
     elif data[0] == "item":
         context.user_data["item"] = data[1]
-        processes = get_process_columns()
-
-        kb = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")] for p in processes]
+        kb = [[InlineKeyboardButton(p, callback_data=f"process|{p}")] for p in PROCESS_COLUMNS]
         kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
-
         await q.edit_message_text(
             f"Item: {data[1]}\n⚙ Select Process:",
-            reply_markup=InlineKeyboardMarkup(kb),
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif data[0] == "proc":
+    elif data[0] == "process":
         context.user_data["process"] = data[1]
         await q.edit_message_text(
-            f"✏ Enter quantity for **{data[1]}**:"
+            f"✏ Enter quantity for *{data[1]}*:",
+            parse_mode="Markdown"
         )
 
-    elif data[0] == "back_clients":
+    elif data[0].startswith("back"):
         await start(update, context)
 
-    elif data[0] == "back_projects":
-        await start(update, context)
-
-    elif data[0] == "back_items":
-        client = context.user_data["client"]
-        await buttons(
-            Update(update.update_id, callback_query=q._replace(data=f"client|{client}")),
-            context,
-        )
-
-async def quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "process" not in context.user_data:
         return
 
-    try:
-        qty = int(update.message.text.replace("+", ""))
-    except ValueError:
-        await update.message.reply_text("❌ Enter a valid number")
-        return
-
+    qty = safe_int(update.message.text)
     client = context.user_data["client"]
     project = context.user_data["project"]
     item = context.user_data["item"]
     process = context.user_data["process"]
 
     row = find_row(client, project, item)
-    col = col_index(process)
+    col = HEADERS.index(process) + 1
 
-    current_val = summary.cell(row, col).value
-    current = int(current_val) if current_val and str(current_val).isdigit() else 0
+    current = summary.cell(row, col).value
+    new_value = safe_int(current) + qty
+    summary.update_cell(row, col, new_value)
 
-    new_val = current + qty
-    summary.update_cell(row, col, new_val)
-
-    # ===== LOG ENTRY =====
-    logs.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        update.effective_user.username or "",
-        client,
-        project,
-        item,
-    ])
-
-    await update.message.reply_text(
-        f"✅ Updated\n{process}: {current} → {new_val}"
+    # Username fallback FIX
+    user = update.effective_user
+    username = (
+        f"@{user.username}" if user.username
+        else user.full_name if user.full_name
+        else str(user.id)
     )
 
-    context.user_data.pop("process")
+    logs.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        username,
+        client,
+        project,
+        item
+    ])
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"✅ Added {qty} to {process}\n\nUse /start for next entry"
+    )
 
 # =========================
 # Webhook
@@ -220,9 +184,10 @@ async def quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def health(request):
     return web.Response(text="OK")
 
-async def webhook(request):
-    app = request.app["telegram_app"]
-    update = Update.de_json(await request.json(), app.bot)
+async def telegram_webhook(request):
+    app: Application = request.app["telegram_app"]
+    data = await request.json()
+    update = Update.de_json(data, app.bot)
     await app.process_update(update)
     return web.Response(text="OK")
 
@@ -235,7 +200,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quantity))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quantity_input))
 
     await app.initialize()
     await app.start()
@@ -243,19 +208,18 @@ async def main():
     web_app = web.Application()
     web_app["telegram_app"] = app
     web_app.router.add_get("/", health)
-    web_app.router.add_post(f"/{os.environ['TELEGRAM_TOKEN']}", webhook)
+    web_app.router.add_post(f"/{os.environ['TELEGRAM_TOKEN']}", telegram_webhook)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    await web.TCPSite(
-        runner, "0.0.0.0", int(os.environ.get("PORT", 10000))
-    ).start()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
+    await site.start()
 
     await app.bot.set_webhook(
         f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
     )
 
-    print("✅ Progress Tracker Bot RUNNING")
+    print("✅ Bot fully running")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
