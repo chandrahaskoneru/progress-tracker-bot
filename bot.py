@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from datetime import datetime
 from aiohttp import web
 
 import gspread
@@ -21,80 +22,74 @@ from telegram.ext import (
 )
 
 # =========================
-# Google Sheets (Sheets API ONLY)
+# Google Sheets (NO Drive API)
 # =========================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-creds = Credentials.from_service_account_info(
-    json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
-    scopes=SCOPES,
-)
-
+creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
-# 🔴 IMPORTANT: open_by_key (NO DRIVE API)
-sheet = gc.open_by_key(
-    os.environ["SHEET_ID"]
-).worksheet(os.environ["SHEET_TAB"])
+SHEET_ID = os.environ["SHEET_ID"]
 
-HEADERS = sheet.row_values(1)
-
-def col_index(name):
-    return HEADERS.index(name) + 1
+summary = gc.open_by_key(SHEET_ID).worksheet("Summary")
+logs = gc.open_by_key(SHEET_ID).worksheet("Logs")
 
 # =========================
-# Data helpers
+# Process columns (NO plan columns)
 # =========================
+
+PROCESS_COLUMNS = {
+    "Raw Material": 5,
+    "Rough Turning": 7,
+    "Heat Treatment": 9,
+    "Final Machining": 11,
+    "Keyway": 13,
+    "GC": 15,
+    "Spline": 17,
+    "CG": 19,
+    "SG": 21,
+    "IH": 23,
+    "GG": 25,
+}
+
+# =========================
+# Helpers
+# =========================
+
+def rows():
+    return summary.get_all_records()
 
 def get_clients():
-    return sorted({
-        r["Client"].strip()
-        for r in sheet.get_all_records()
-        if r.get("Client")
-    })
+    return sorted({r["Client"] for r in rows() if r.get("Client")})
 
 def get_projects(client):
     return sorted({
-        r["Project"]
-        for r in sheet.get_all_records()
-        if r.get("Client") == client
+        r["Project"] for r in rows()
+        if r.get("Client") == client and r.get("Project")
     })
 
 def get_items(client, project):
     return sorted({
-        r.get("Item Description", "")
-        for r in sheet.get_all_records()
-        if r.get("Client") == client and r.get("Project") == project
+        r["Item Description"] for r in rows()
+        if r.get("Client") == client
+        and r.get("Project") == project
+        and r.get("Item Description")
     })
 
-PROCESSES = [
-    "Raw Material",
-    "Rough Turning",
-    "Heat treatment",
-    "Final Machining",
-    "Keyway",
-    "GC",
-    "Spline",
-    "CG",
-    "SG",
-    "IH",
-    "GG",
-]
-
 def find_row(client, project, item):
-    rows = sheet.get_all_records()
-    for i, r in enumerate(rows, start=2):
+    for idx, r in enumerate(rows(), start=2):
         if (
-            r.get("Client") == client
-            and r.get("Project") == project
-            and r.get("Item Description") == item
+            r["Client"] == client
+            and r["Project"] == project
+            and r["Item Description"] == item
         ):
-            return i
+            return idx
     return None
 
 # =========================
-# Telegram Handlers
+# Telegram Flow
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,15 +97,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clients = get_clients()
 
     if not clients:
-        await update.message.reply_text("❌ No clients found.")
+        await update.message.reply_text("❌ No clients found in sheet.")
         return
 
-    keyboard = [[InlineKeyboardButton(c, callback_data=f"client|{c}")]
-                for c in clients]
-
+    kb = [[InlineKeyboardButton(c, callback_data=f"client|{c}")] for c in clients]
     await update.message.reply_text(
         "📋 Select Client:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(kb)
     )
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -122,77 +115,81 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["client"] = data[1]
         projects = get_projects(data[1])
 
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"project|{p}")]
-                    for p in projects]
-        keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back")])
+        kb = [[InlineKeyboardButton(p, callback_data=f"project|{p}")] for p in projects]
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_clients")])
 
         await q.edit_message_text(
             "📁 Select Project:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
     elif data[0] == "project":
         context.user_data["project"] = data[1]
         items = get_items(context.user_data["client"], data[1])
 
-        keyboard = [[InlineKeyboardButton(i, callback_data=f"item|{i}")]
-                    for i in items]
+        kb = [[InlineKeyboardButton(i, callback_data=f"item|{i}")] for i in items]
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_projects")])
 
         await q.edit_message_text(
             "📦 Select Item Description:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
     elif data[0] == "item":
         context.user_data["item"] = data[1]
 
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"proc|{p}")]
-                    for p in PROCESSES]
+        kb = [
+            [InlineKeyboardButton(p, callback_data=f"process|{p}")]
+            for p in PROCESS_COLUMNS.keys()
+        ]
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="back_items")])
 
         await q.edit_message_text(
-            "⚙ Select Process:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            "⚙️ Select Process:",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif data[0] == "proc":
+    elif data[0] == "process":
         context.user_data["process"] = data[1]
-        context.user_data["await_qty"] = True
+        await q.edit_message_text("✏️ Enter quantity to add:")
 
-        await q.edit_message_text(
-            "✏️ Enter quantity to add (example: +2 or 5)"
-        )
+    elif data[0].startswith("back"):
+        await start(update, context)
+
+# =========================
+# Quantity input
+# =========================
 
 async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("await_qty"):
+    if "process" not in context.user_data:
         return
 
     try:
-        qty = int(update.message.text.replace("+", ""))
+        qty = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("❌ Enter a number like +2 or 5")
+        await update.message.reply_text("❌ Enter a valid number.")
         return
 
-    row = find_row(
-        context.user_data["client"],
-        context.user_data["project"],
-        context.user_data["item"],
-    )
+    c = context.user_data["client"]
+    p = context.user_data["project"]
+    i = context.user_data["item"]
+    proc = context.user_data["process"]
 
-    col = col_index(context.user_data["process"])
-    current = sheet.cell(row, col).value
-    current = int(current) if current else 0
+    row = find_row(c, p, i)
+    col = PROCESS_COLUMNS[proc]
 
-    sheet.update_cell(row, col, current + qty)
+    current = summary.cell(row, col).value or 0
+    summary.update_cell(row, col, int(current) + qty)
 
-    await update.message.reply_text(
-        f"✅ Updated\n\n"
-        f"Client: {context.user_data['client']}\n"
-        f"Project: {context.user_data['project']}\n"
-        f"Item: {context.user_data['item']}\n"
-        f"Process: {context.user_data['process']}\n"
-        f"Added: {qty}"
-    )
+    logs.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        update.effective_user.username,
+        c,
+        p,
+        f"{proc} +{qty}"
+    ])
 
+    await update.message.reply_text("✅ Quantity updated successfully!")
     context.user_data.clear()
 
 # =========================
@@ -213,8 +210,11 @@ async def telegram_webhook(request):
 # =========================
 
 async def main():
-    app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
+    TOKEN = os.environ["TELEGRAM_TOKEN"]
+    PORT = int(os.environ.get("PORT", 10000))
+    BASE_URL = os.environ["RENDER_EXTERNAL_URL"]
 
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quantity_input))
@@ -225,17 +225,15 @@ async def main():
     web_app = web.Application()
     web_app["telegram_app"] = app
     web_app.router.add_get("/", health)
-    web_app.router.add_post(f"/{os.environ['TELEGRAM_TOKEN']}", telegram_webhook)
+    web_app.router.add_post(f"/{TOKEN}", telegram_webhook)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
-    await app.bot.set_webhook(
-        f"{os.environ['RENDER_EXTERNAL_URL']}/{os.environ['TELEGRAM_TOKEN']}"
-    )
+    await app.bot.set_webhook(f"{BASE_URL}/{TOKEN}")
+    print("🚀 Bot fully operational")
 
-    print("🚀 Bot running (NO Drive API)")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
